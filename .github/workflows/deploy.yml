@@ -1,0 +1,62 @@
+name: Deploy to Cloudflare
+
+# Builds, tests and deploys to your Cloudflare account.
+# Does nothing until DEPLOY_ENABLED is set to "true" (repo variable),
+# so the repo is safe to sit here before the first manual setup.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Tests
+        run: pnpm test
+
+      - name: Restore deploy settings and secrets
+        env:
+          DEPLOY_CONFIG: ${{ secrets.COWORKERS_DEPLOY_JSON }}
+          DEV_VARS: ${{ secrets.DEV_VARS_PRODUCTION }}
+        run: |
+          if [ -z "$DEPLOY_CONFIG" ] || [ -z "$DEV_VARS" ]; then
+            echo "::error::Set the COWORKERS_DEPLOY_JSON and DEV_VARS_PRODUCTION secrets first."
+            exit 1
+          fi
+          printf '%s' "$DEPLOY_CONFIG" > coworkers.deploy.json
+          printf '%s\n' "$DEV_VARS" > .dev.vars.production
+          # Refuse to deploy an unlocked (open-to-everyone) build.
+          node -e 'const f=require("./coworkers.deploy.json"); if(!f.accessTeamDomain||!f.accessAud||f.accessAud==="locked"){console.error("coworkers.deploy.json has no Access values. Run pnpm run setup locally first.");process.exit(1)}'
+
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm run deploy --secrets-file .dev.vars.production
+
+      - name: Clean up
+        if: always()
+        run: rm -f coworkers.deploy.json .dev.vars.production
