@@ -6,6 +6,7 @@
 import type { RobotHeadShape } from "robot-heads"
 import type { DeploymentModels, ModelSettings } from "./models"
 import type { ShopPick } from "./shop"
+import type { SurfaceActionMeta } from "./surface/types"
 
 export type BotStatus = "idle" | "thinking" | "working" | "action_needed"
 
@@ -111,7 +112,11 @@ export interface HubState {
   models?: ModelSettings
   /** Absent on hubs created before pipelines existed. */
   pipelines?: Pipeline[]
-  /** Recent runs of every pipeline, newest first. Outputs are clipped. */
+  /**
+   * Each pipeline's latest run, plus any still going, newest first. Step
+   * outputs are left out to keep state small: the full history comes from
+   * `pipelineRunHistory`.
+   */
   pipelineRuns?: PipelineRun[]
   /** The deployment's own models and gateway, refreshed on every start. */
   deployment?: DeploymentModels
@@ -166,6 +171,10 @@ export interface DeskCardInput {
     messageId?: string
     approvalId?: string
     script?: { runId: string; callId: string }
+    /** A surface the bot pinned: drawn inside the card, live. */
+    surface?: { id: string; version: number }
+    /** A pipeline's approval step; the card answers it. */
+    pipeline?: { pipelineId: string; runId: string; step: number }
   }
   createdAt: number
 }
@@ -597,10 +606,15 @@ export interface MessageMeta {
   routine?: { id: string; runId: string; attempt: number }
   /** On the trigger of a delegated task: its result goes back automatically. */
   task?: BotTask
-  /** On a message carrying another bot's result for a task this bot handed out. */
-  taskResult?: { taskId: string }
+  /**
+   * On a message carrying results for tasks this bot handed out. Results
+   * that land close together come in one message: `taskIds` lists them all.
+   */
+  taskResult?: { taskId: string; taskIds?: string[] }
   /** On a "Buy" message from the product panel: exactly what was picked. */
   pick?: ShopPick
+  /** On a message a surface's button sent: which button, on what. */
+  surfaceAction?: SurfaceActionMeta
 }
 
 /** Where a task's result goes when the bot working on it finishes. */

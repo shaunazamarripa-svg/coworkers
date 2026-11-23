@@ -35,6 +35,11 @@ import type { BrowserRuntime } from "@cloudflare/think/tools/browser"
 import { exports } from "cloudflare:workers"
 import { callable, getAgentByName } from "agents"
 import { CHAT_MESSAGE_TYPES } from "agents/chat"
+import {
+  CLIENT_MESSAGES,
+  olderThan,
+  windowFrame,
+} from "@/lib/transcript-window"
 import type { ContextConfig } from "agents/context"
 import { isAutoReplyEmail } from "agents/email"
 import { emailDirectory } from "./email-directory"
@@ -45,7 +50,7 @@ import {
 } from "./email-routing"
 import type { AgentEmail } from "agents/email"
 import { jsonSchema, tool } from "ai"
-import type { JSONSchema7, ToolSet, UIMessage } from "ai"
+import type { JSONSchema7, StepResult, ToolSet, UIMessage } from "ai"
 import PostalMime from "postal-mime"
 import type { ModelSettings } from "@/lib/models"
 import { z } from "zod"
@@ -184,12 +189,22 @@ import {
 } from "./shop"
 import { toMinorUnits } from "@/lib/shop"
 import { choiceOptions } from "@/lib/choices"
+import { SurfaceStore } from "./surface-store"
+import { describeCatalog } from "@/lib/surface/describe"
 import {
-  MAX_SHOW_BLOCKS,
-  MAX_SHOW_ITEMS,
-  SHOW_BLOCK_TYPES,
-  SHOW_TONES,
-} from "@/lib/show"
+  actionAt,
+  checkActionValues,
+  showSurface,
+  surfaceEndsStep,
+  surfaceForModel,
+  surfaceLine,
+  updateSurface,
+} from "@/lib/surface/surface"
+import type {
+  Surface,
+  SurfaceActionMeta,
+  SurfaceToolOutput,
+} from "@/lib/surface/types"
 import type { ShopCheckout, ShopProduct, ShopSearchResult } from "@/lib/shop"
 import type { CrawlInput, QuickEngine } from "./web-tools"
 
@@ -319,7 +334,9 @@ const READ_ONLY_TOOLS = new Set([
   "activate_skill",
   "read_skill_resource",
   ...SHOP_READS,
-  "show",
+  "show_surface",
+  "update_surface",
+  "list_surfaces",
 ])
 /** A foreground turn longer than this gets a push when it finishes. */
 const LONG_TURN_MS = 90_000
@@ -332,6 +349,16 @@ const DAY_MS = 86_400_000
 const DELEGATION_STALE_MS = 3 * DAY_MS
 /** How much of a task's instructions a result message repeats back. */
 const TASK_ECHO_CHARS = 300
+/**
+ * A result waits this long before it wakes the bot, so others that land
+ * meanwhile come in the same message instead of one turn each.
+ */
+const RESULT_BATCH_S = 5
+/**
+ * A task or routine turn that ended without reporting, and is older than
+ * this, is settled by the sweep so whoever is waiting hears back.
+ */
+const STRANDED_MS = 30 * 60_000
 const MAX_FILE_PREVIEW_BYTES = 200_000
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 const WORKSPACE_ROOT = "/workspace"
@@ -394,6 +421,23 @@ interface DelegationRow {
   status: "open" | TaskOutcome["status"]
   hops: number
   background: number
+  /** The bot doing it, so a stop can reach it. Null on rows from before. */
+  to_bot_id: string | null
+  /** The user message of the turn that handed it out. */
+  trigger_id: string | null
+  /** The result, as JSON, from when it came back until it is delivered. */
+  result: string | null
+  /** When the result went to the model, in a (possibly shared) message. */
+  delivered_at: number | null
+}
+
+/** A task's result, waiting in `delegations.result` to be delivered. */
+interface HeldResult {
+  from: MessageOrigin
+  status: TaskOutcome["status"]
+  error?: string
+  text: string
+  files: string[]
 }
 
 interface RoutineRunRow {
@@ -433,7 +477,8 @@ function pendingApprovalId(part: UIMessage["parts"][number]): string | null {
 
 /** Close an approval nobody answered, so the card stops asking. */
 function expireApproval(
-  part: UIMessage["parts"][number]
+  part: UIMessage["parts"][number],
+  reason = "Nobody answered within 24 hours, so this was not done."
 ): UIMessage["parts"][number] {
   const p = part as { approval?: Record<string, unknown> }
   return {
@@ -442,7 +487,7 @@ function expireApproval(
     approval: {
       ...p.approval,
       approved: false,
-      reason: "Nobody answered within 24 hours, so this was not done.",
+      reason,
     },
   } as UIMessage["parts"][number]
 }
@@ -511,6 +556,18 @@ function finalText(message: UIMessage) {
 function isNoUpdate(text: string) {
   const t = text.trim()
   return t.startsWith(NO_UPDATE) || t.endsWith(NO_UPDATE)
+}
+
+/** The turn showed or changed a surface. */
+function wroteSurface(message: UIMessage) {
+  return message.parts.some((part) => {
+    const p = part as { type: string; state?: string; output?: unknown }
+    return (
+      (p.type === "tool-show_surface" || p.type === "tool-update_surface") &&
+      p.state === "output-available" &&
+      (p.output as { ok?: unknown } | undefined)?.ok === true
+    )
+  })
 }
 
 function minutesOf(hhmm: string) {
@@ -728,6 +785,14 @@ export class BotAgent extends Think<Env, BotState> {
    */
   #heldApprovals = new Map<string, boolean>()
 
+  #surfaceStore?: SurfaceStore
+
+  /** Surfaces this bot showed, the newest copy of each. */
+  private get surfaces(): SurfaceStore {
+    this.#surfaceStore ??= new SurfaceStore(this.ctx.storage.sql)
+    return this.#surfaceStore
+  }
+
   /** Apps this bot built, their links and their data. */
   private get apps(): AppStore {
     this.#appStore ??= new AppStore(this.ctx.storage.sql, (slug, token) =>
@@ -879,6 +944,7 @@ export class BotAgent extends Think<Env, BotState> {
   // ── Lifecycle ───────────────────────────────────────────────────────
 
   async onStart() {
+    this.windowClientTranscript()
     this.watchChatApprovals()
     this.sql`CREATE TABLE IF NOT EXISTS activity (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -952,6 +1018,22 @@ export class BotAgent extends Think<Env, BotState> {
       hops INTEGER NOT NULL,
       background INTEGER NOT NULL
     )`
+    // Added later, each on its own: older bots have the table without them.
+    const delegationColumns = this.ctx.storage.sql
+      .exec<{ name: string }>(`PRAGMA table_info(delegations)`)
+      .toArray()
+    for (const column of [
+      "to_bot_id TEXT",
+      "trigger_id TEXT",
+      "result TEXT",
+      "delivered_at INTEGER",
+    ]) {
+      if (!delegationColumns.some((c) => c.name === column.split(" ")[0])) {
+        this.ctx.storage.sql.exec(
+          `ALTER TABLE delegations ADD COLUMN ${column}`
+        )
+      }
+    }
     // One row per unprompted message, for the daily cap.
     this.sql`CREATE TABLE IF NOT EXISTS proactive_log (
       at INTEGER NOT NULL
@@ -977,6 +1059,7 @@ export class BotAgent extends Think<Env, BotState> {
       background INTEGER NOT NULL
     )`
     this.apps.init()
+    this.surfaces.init()
     // Bots created before proactive work, skills or apps existed.
     if (!this.state.proactive || !this.state.skills || !this.state.apps) {
       this.setState({
@@ -1311,6 +1394,7 @@ export class BotAgent extends Think<Env, BotState> {
         path: `${this.#origin}${this.apps.ownerLink(app.slug).path}`,
         collections: this.apps.collections(app.slug),
       })),
+      surfaces: this.surfaces.open().slice(0, 15).map(surfaceLine),
     })
     return {
       model: this.turnModel(),
@@ -1327,6 +1411,15 @@ export class BotAgent extends Think<Env, BotState> {
           })
       ),
       tools: this.#appTools,
+      // With the user here, a finished surface is the reply: end the turn
+      // there rather than let the model talk on under it. Background turns
+      // still need their closing NO_UPDATE or note.
+      ...(this.isBackgroundTurn()
+        ? {}
+        : {
+            stopWhen: ({ steps }: { steps: StepResult<ToolSet>[] }) =>
+              surfaceEndsStep(steps.at(-1)),
+          }),
     }
   }
 
@@ -1846,13 +1939,17 @@ export class BotAgent extends Think<Env, BotState> {
     return {
       readAttachments: (paths) => this.readAttachments(paths),
       openDelegation: ({ taskId, to, task, hops, background }) => {
+        // The turn handing it out, so stopping that turn stops this too.
+        const trigger =
+          this.messages.findLast((m) => m.role === "user")?.id ?? null
         this.sql`INSERT OR IGNORE INTO delegations
-          (id, to_name, task, created_at, status, hops, background)
+          (id, to_name, task, created_at, status, hops, background, trigger_id)
           VALUES (${taskId}, ${to}, ${task}, ${Date.now()}, 'open', ${hops},
-                  ${background ? 1 : 0})`
+                  ${background ? 1 : 0}, ${trigger})`
       },
-      confirmDelegation: (taskId, to) => {
-        this.sql`UPDATE delegations SET to_name = ${to} WHERE id = ${taskId}`
+      confirmDelegation: (taskId, to, botId) => {
+        this.sql`UPDATE delegations SET to_name = ${to}, to_bot_id = ${botId}
+          WHERE id = ${taskId}`
       },
       dropDelegation: (taskId) => {
         this.sql`DELETE FROM delegations WHERE id = ${taskId}`
@@ -2166,56 +2263,138 @@ export class BotAgent extends Think<Env, BotState> {
         },
       }),
 
-      show: tool({
+      show_surface: tool({
         description: [
-          "Show part of your reply as blocks the user can scan and tap, instead of prose or a Markdown table. Blocks appear in the chat in the order given.",
-          "- stats: 2-4 headline numbers. items: label, value, optional detail.",
-          "- list: things you found. Optional title; items: label (the name), value (price, count, date), detail (the one fact that matters), url (opens it), tag (a 1-2 word verdict) with tone.",
-          "- callout: one caveat or piece of news the user must not miss. text, optional title, tone.",
-          "- actions: 1-3 next steps to tap. items: label only, written as the user would say it ('Watch OLX daily under ₹42,000'); tapping sends it to you as their message.",
-          "Every value is plain text: no Markdown inside blocks.",
+          "Show results, a form or a live status as a surface: UI built from the components below, drawn in the app's own design. Use it instead of prose or a Markdown table when the user will scan, compare, fill in or act on something.",
+          "layout is a list of components (nested through children). Props are plain text, never Markdown. Any prop marked ~ can be { \"$bind\": \"/pointer\" } to read it from data, and a list prop can be bound whole to an array in data, so updating data later changes what is shown.",
+          'Buttons take one action: { "say": "text" } sends that text as the user\'s message, { "event": "name" } sends you the form\'s field values (or { "event": "name", "fields": ["/a"] } outside a form), { "link": "https://..." } opens a page. An event arrives as the user\'s next message.',
+          "Showing again with an id that exists replaces that surface. Pick a short readable id, like 'macbook-watch', so you can update it later.",
+          "",
+          "Components (* required, ~ bindable):",
+          describeCatalog(),
         ].join("\n"),
         inputSchema: z.object({
-          blocks: z
+          id: z
+            .string()
+            .max(48)
+            .optional()
+            .describe(
+              "Lowercase letters, digits and -, e.g. 'macbook-watch'. Reuse it to replace the surface."
+            ),
+          title: z
+            .string()
+            .max(80)
+            .optional()
+            .describe("What it is, in a few words. Required with desk."),
+          layout: z
+            .array(z.record(z.string(), z.unknown()))
+            .describe(
+              'Components top to bottom, e.g. [{ "type": "Stats", "items": [...] }, { "type": "List", "items": { "$bind": "/listings" } }]'
+            ),
+          data: z
+            .record(z.string(), z.unknown())
+            .optional()
+            .describe("Values the layout binds to."),
+          desk: z
+            .object({
+              lane: z.enum(["fyi", "done"]).optional(),
+              why: z
+                .string()
+                .max(140)
+                .describe("One line: why it is on the Desk now."),
+            })
+            .optional()
+            .describe(
+              "Also pin it to the user's Desk. Only for something they will come back to: a watch, a running task, a decision waiting on them."
+            ),
+        }),
+        execute: async (input): Promise<SurfaceToolOutput> => {
+          const id = typeof input.id === "string" ? input.id : undefined
+          const output = showSurface(
+            input,
+            id ? this.surfaces.get(id) : undefined,
+            this.surfaces.ids()
+          )
+          if (output.ok) await this.storeSurface(output.surface)
+          return output
+        },
+        toModelOutput: ({ output }) => ({
+          type: "text",
+          value: surfaceForModel(output),
+        }),
+      }),
+
+      update_surface: tool({
+        description:
+          "Change a surface you showed before, in this turn or an earlier one, instead of showing a new one. Usually you change data: each change sets the value at a JSON Pointer (null deletes; /list/- appends). Replace layout only when what is shown changes shape (a form becomes a confirmation). close: true freezes it read-only once it is finished.",
+        inputSchema: z.object({
+          id: z.string().max(48).describe("The surface's id."),
+          data: z
             .array(
               z.object({
-                type: z.enum(SHOW_BLOCK_TYPES),
-                title: z.string().max(80).optional(),
-                text: z
-                  .string()
-                  .max(300)
-                  .optional()
-                  .describe("callout only: its body"),
-                tone: z
-                  .enum(SHOW_TONES)
-                  .optional()
-                  .describe("callout only: warn for a caveat, good for news"),
-                items: z
-                  .array(
-                    z.object({
-                      label: z.string().max(120),
-                      value: z.string().max(40).optional(),
-                      detail: z.string().max(160).optional(),
-                      url: z.string().max(600).optional(),
-                      tag: z.string().max(24).optional(),
-                      tone: z
-                        .enum(SHOW_TONES)
-                        .optional()
-                        .describe("Colours the tag, or a stat's value"),
-                    })
-                  )
-                  .max(MAX_SHOW_ITEMS)
-                  .optional()
-                  .describe("stats, list and actions"),
+                path: z.string().describe("JSON Pointer, e.g. '/price'"),
+                value: z.unknown().describe("The new value; null deletes."),
               })
             )
-            .min(1)
-            .max(MAX_SHOW_BLOCKS),
+            .optional(),
+          layout: z
+            .array(z.record(z.string(), z.unknown()))
+            .optional()
+            .describe("A whole new layout, same components as show_surface."),
+          title: z.string().max(80).optional(),
+          close: z.boolean().optional(),
+          desk: z
+            .object({
+              lane: z.enum(["fyi", "done"]).optional(),
+              why: z.string().max(140),
+            })
+            .optional()
+            .describe("Pin it to the Desk, or change why it is there."),
+          unpin: z
+            .boolean()
+            .optional()
+            .describe("Take it off the Desk. It stays in the chat."),
         }),
-        execute: async ({ blocks }) => ({
-          shown: blocks.length,
-          next: "The user can see these now. Do not repeat them in text. End your turn, or add at most one short line the blocks did not cover.",
+        execute: async (input): Promise<SurfaceToolOutput> => {
+          const prev = this.surfaces.get(input.id)
+          if (!prev) {
+            const ids = [...this.surfaces.ids()].slice(0, 20)
+            return {
+              ok: false,
+              error: `There is no surface "${input.id}".`,
+              problems: [
+                {
+                  path: "/id",
+                  message: ids.length
+                    ? `Your surfaces: ${ids.join(", ")}. Or show a new one with show_surface.`
+                    : "Show one with show_surface first.",
+                },
+              ],
+            }
+          }
+          const output = updateSurface(
+            { ...input, desk: input.unpin ? false : input.desk },
+            prev
+          )
+          if (output.ok) await this.storeSurface(output.surface, prev)
+          return output
+        },
+        toModelOutput: ({ output }) => ({
+          type: "text",
+          value: surfaceForModel(output),
         }),
+      }),
+
+      list_surfaces: tool({
+        description:
+          "Your open surfaces: id, title, components, fields and data keys. Use it to find the id to update.",
+        inputSchema: z.object({}),
+        execute: async () => {
+          const open = this.surfaces.open()
+          return open.length
+            ? open.map(surfaceLine).join("\n")
+            : "You have no open surfaces."
+        },
       }),
 
       connect_app: tool({
@@ -4451,6 +4630,12 @@ export class BotAgent extends Think<Env, BotState> {
     // An approval card keeps the turn open; the result goes back once the
     // continuation finishes.
     if (task && !waiting) await this.finishTask(task, result)
+    // Stopped: the work this turn handed to other bots stops with it.
+    if (result.status === "aborted" && trigger) {
+      await this.cancelDelegations({ triggerId: trigger.id })
+    }
+    // Results that came back while this turn ran wake the bot now.
+    await this.queueResultDelivery()
     const routineRun = metaOf(trigger).routine
     if (routineRun) {
       await this.finishRoutineRun(routineRun, result, {
@@ -4467,11 +4652,14 @@ export class BotAgent extends Think<Env, BotState> {
 
     // Nothing worth saying: drop the turn so it neither shows up nor
     // fills the context. Deleting re-parents anything that came after.
+    // A turn that changed a surface keeps its messages: the thread draws
+    // surfaces from the tool results in them.
     if (
       background &&
       !waiting &&
       result.status === "completed" &&
-      (!text || isNoUpdate(finalText(result.message)))
+      (!text || isNoUpdate(finalText(result.message))) &&
+      !wroteSurface(result.message)
     ) {
       await this.report({ status })
       if (trigger) {
@@ -4582,6 +4770,7 @@ export class BotAgent extends Think<Env, BotState> {
     void this.applyHeldApprovals()
     this.detachScripts()
     void this.setStatus("idle")
+    void this.queueResultDelivery()
     return error
   }
 
@@ -4660,6 +4849,11 @@ export class BotAgent extends Think<Env, BotState> {
       } catch (err) {
         console.error("Expiring an approval failed", err)
       }
+    }
+    try {
+      await this.settleStranded(now)
+    } catch (err) {
+      console.error("Settling stranded work failed", err)
     }
     try {
       await this.sweepScripts(now)
@@ -4832,6 +5026,97 @@ export class BotAgent extends Think<Env, BotState> {
   @callable()
   async deleteSecret(name: string) {
     this.sql`DELETE FROM bot_secrets WHERE name = ${name}`
+  }
+
+  /**
+   * A button on one of this bot's surfaces was pressed. The user is acting,
+   * so this is a turn with them present, like a message they typed. A retry
+   * or a double tap names the same version and button, so it starts one turn.
+   */
+  @callable()
+  async surfaceAction(
+    surfaceId: string,
+    version: number,
+    target: string,
+    values: unknown
+  ) {
+    const surface = this.surfaces.get(surfaceId)
+    if (!surface) throw new Error("That is no longer here.")
+    if (surface.status === "closed") {
+      throw new Error("This is finished, so its buttons no longer work.")
+    }
+    if (surface.version !== version) {
+      throw new Error("This changed while you were looking. Check it again.")
+    }
+    const found = actionAt(surface, target)
+    if (!found || !("event" in found.action)) {
+      throw new Error("That button does nothing here.")
+    }
+    const checked = checkActionValues(surface, found.action, values)
+    if ("error" in checked) throw new Error(checked.error)
+    const surfaceAction: SurfaceActionMeta = {
+      surfaceId,
+      ...(surface.title ? { title: surface.title } : {}),
+      label: found.label,
+      event: found.action.event,
+    }
+    const sent = { ...checked.values, ...found.values }
+    const filled = Object.keys(sent).length > 0
+    const text = [
+      `[Pressed "${found.label}" on your surface "${surfaceId}"${surface.title ? ` (${surface.title})` : ""}. Event: ${found.action.event}]`,
+      ...(filled ? [JSON.stringify(sent)] : []),
+    ].join("\n")
+    await this.runTurn({
+      mode: "submit",
+      idempotencyKey: `surface:${surfaceId}:${version}:${target}`,
+      input: {
+        id: crypto.randomUUID(),
+        role: "user",
+        parts: [{ type: "text", text }],
+        metadata: { at: Date.now(), surfaceAction } satisfies MessageMeta,
+      },
+    })
+  }
+
+  /**
+   * Durable Object RPC from the hub: a say button on a pinned surface. Sent
+   * as the user's own message, like the same button in the chat.
+   */
+  async surfaceSay(surfaceId: string, target: string) {
+    const surface = this.surfaces.get(surfaceId)
+    const found = surface ? actionAt(surface, target) : null
+    if (!found || !("say" in found.action)) {
+      throw new Error("That button does nothing here.")
+    }
+    await this.runTurn({
+      mode: "submit",
+      input: {
+        id: crypto.randomUUID(),
+        role: "user",
+        parts: [{ type: "text", text: found.action.say }],
+        metadata: { at: Date.now() } satisfies MessageMeta,
+      },
+    })
+  }
+
+  /** Keep the newest copy of a surface, and the Desk in step with it. */
+  private async storeSurface(surface: Surface, prev?: Surface) {
+    this.surfaces.save(surface)
+    const pinned = surface.desk && surface.status === "open"
+    if (!pinned && !prev?.desk) return
+    try {
+      const hub = await this.hub()
+      if (pinned) {
+        const origin =
+          metaOf(this.messages.findLast((m) => m.role === "user")).origin
+            ?.kind ?? "chat"
+        await hub.pinSurface(this.botId, surface, origin)
+      } else {
+        await hub.unpinSurface(this.botId, surface.id)
+      }
+    } catch (err) {
+      console.error("Syncing a surface to the Desk failed", err)
+    }
   }
 
   /** Called by the ask_user card, just before it approves the call. */
@@ -5017,31 +5302,72 @@ export class BotAgent extends Think<Env, BotState> {
   ) {
     const row = this.sql<DelegationRow>`SELECT * FROM delegations
       WHERE id = ${taskId}`[0]
-    // A re-delivered result changes nothing.
-    if (row && row.status !== "open") return
-    this.sql`UPDATE delegations SET status = ${outcome.status},
-      finished_at = ${Date.now()} WHERE id = ${taskId}`
+    // A re-delivered result, or one for a task this bot stopped, changes
+    // nothing.
+    if (!row || row.status !== "open") return
     const saved = await this.saveAttachments(origin.name, {
       key: `result:${taskId}`,
       files: outcome.files,
     })
-    const lines = [`[Result from the ${origin.name} bot]`]
-    if (row) lines.push(`Your task: ${clip(row.task, TASK_ECHO_CHARS)}`)
-    if (outcome.status !== "done") {
-      lines.push(
-        `It did not finish (${outcome.status}${outcome.error ? `: ${outcome.error}` : ""}).`
-      )
+    const held: HeldResult = {
+      from: origin,
+      status: outcome.status,
+      ...(outcome.error ? { error: outcome.error } : {}),
+      text: outcome.result,
+      files: saved,
     }
-    lines.push(
-      "",
-      outcome.result.trim() || "(It ended without a written reply.)"
-    )
-    if (saved.length) {
-      lines.push(
-        "",
-        "Files it sent back, copied into your workspace:",
-        ...saved.map((p) => `- ${p}`)
-      )
+    this.sql`UPDATE delegations SET status = ${outcome.status},
+      finished_at = ${Date.now()}, result = ${JSON.stringify(held)}
+      WHERE id = ${taskId} AND status = 'open'`
+    await this.queueResultDelivery()
+  }
+
+  /**
+   * Wake the bot with the results that came back, after a short pause so
+   * results landing together share one message. While a turn runs they
+   * wait for it to end (`onChatResponse` calls this again).
+   */
+  private async queueResultDelivery() {
+    const waiting = this.sql<{ n: number }>`SELECT COUNT(*) AS n
+      FROM delegations WHERE result IS NOT NULL AND delivered_at IS NULL`[0]
+    if (!waiting?.n) return
+    if (this.getSchedules().some((s) => s.callback === "deliverTaskResults")) {
+      return
+    }
+    await this.schedule(RESULT_BATCH_S, "deliverTaskResults")
+  }
+
+  /** Schedule callback: hand every result that came back to the model at once. */
+  async deliverTaskResults() {
+    // The turn's end delivers them, together with anything else by then.
+    if (this.#turnActive) return
+    const rows = this.sql<DelegationRow>`SELECT * FROM delegations
+      WHERE result IS NOT NULL AND delivered_at IS NULL
+      ORDER BY finished_at ASC`
+    if (!rows.length) return
+    const results = rows.map((row) => ({
+      row,
+      held: JSON.parse(row.result ?? "{}") as HeldResult,
+    }))
+    const names = [...new Set(results.map((r) => r.held.from.name))]
+    const lines: string[] = []
+    for (const { row, held } of results) {
+      if (lines.length) lines.push("", "---", "")
+      lines.push(`[Result from the ${held.from.name} bot]`)
+      lines.push(`Your task: ${clip(row.task, TASK_ECHO_CHARS)}`)
+      if (held.status !== "done") {
+        lines.push(
+          `It did not finish (${held.status}${held.error ? `: ${held.error}` : ""}).`
+        )
+      }
+      lines.push("", held.text.trim() || "(It ended without a written reply.)")
+      if (held.files.length) {
+        lines.push(
+          "",
+          "Files it sent back, copied into your workspace:",
+          ...held.files.map((p) => `- ${p}`)
+        )
+      }
     }
     const open = this.openDelegations()
     lines.push(
@@ -5050,12 +5376,203 @@ export class BotAgent extends Think<Env, BotState> {
         ? `Still waiting on: ${open.map((d) => d.to_name).join(", ")}. Their results arrive as new messages; do not wait for them in this turn.`
         : "Every task you handed out is back."
     )
+    const ids = results.map((r) => r.row.id)
+    const first = results[0].held.from
+    const origin: MessageOrigin =
+      names.length === 1 ? first : { ...first, name: names.join(", ") }
     await this.submitAs(origin, lines.join("\n"), {
-      key: `task-result:${taskId}`,
-      hops: row?.hops,
-      background: row?.background === 1,
-      taskResult: { taskId },
+      key: `task-results:${ids.join(",")}`,
+      hops: Math.max(...results.map((r) => r.row.hops)),
+      // Background only when every task was: one the user started keeps
+      // its approvals.
+      background: results.every((r) => r.row.background === 1),
+      taskResult: { taskId: ids[0], taskIds: ids },
     })
+    const now = Date.now()
+    for (const id of ids) {
+      this.sql`UPDATE delegations SET delivered_at = ${now}, result = NULL
+        WHERE id = ${id}`
+    }
+  }
+
+  /**
+   * Stop tasks this bot handed out: those one turn started, those sent to
+   * one bot, or all of them. Their results, if any still come, are dropped.
+   */
+  async cancelDelegations(
+    which: { triggerId?: string; toBotId?: string } = {}
+  ) {
+    const rows = this.sql<DelegationRow>`SELECT * FROM delegations
+      WHERE status = 'open'`.filter(
+      (r) =>
+        (which.triggerId === undefined || r.trigger_id === which.triggerId) &&
+        (which.toBotId === undefined || r.to_bot_id === which.toBotId)
+    )
+    if (!rows.length) return
+    const now = Date.now()
+    for (const row of rows) {
+      this.sql`UPDATE delegations SET status = 'stopped', finished_at = ${now},
+        delivered_at = ${now} WHERE id = ${row.id}`
+    }
+    const hub = await this.hub()
+    await Promise.allSettled(
+      rows.flatMap((row) =>
+        row.to_bot_id ? [hub.cancelTask(row.to_bot_id, row.id)] : []
+      )
+    )
+  }
+
+  /**
+   * Durable Object RPC from the UserHub: a bot this one handed work to was
+   * deleted. Its open tasks come back as failed, so the bot is not left
+   * waiting on them.
+   */
+  async delegateGone(botId: string) {
+    const rows = this.sql<DelegationRow>`SELECT * FROM delegations
+      WHERE status = 'open' AND to_bot_id = ${botId}`
+    if (!rows.length) return
+    const now = Date.now()
+    for (const row of rows) {
+      const held: HeldResult = {
+        from: { kind: "bot", name: row.to_name },
+        status: "failed",
+        error: "that bot was deleted",
+        text: "",
+        files: [],
+      }
+      this.sql`UPDATE delegations SET status = 'failed', finished_at = ${now},
+        result = ${JSON.stringify(held)} WHERE id = ${row.id}`
+    }
+    await this.queueResultDelivery()
+  }
+
+  /**
+   * Durable Object RPC from the UserHub: whoever handed out this task no
+   * longer wants it. A queued turn is dropped, a running one is stopped
+   * (which stops what it handed out in turn), and one waiting on the user
+   * has its cards closed.
+   */
+  async cancelTask(taskId: string) {
+    const doneKey = `task_done:${taskId}`
+    const pending = await this.listSubmissions({
+      status: ["pending", "running"],
+    })
+    let stopped = false
+    for (const submission of pending) {
+      const key = submission.idempotencyKey ?? ""
+      if (!/^(task|pipeline|client-task):/.test(key)) continue
+      if (!key.endsWith(`:${taskId}`)) continue
+      const done = await this.cancelSubmission(
+        submission.submissionId,
+        "Stopped by whoever handed it out."
+      )
+      if (done.outcome === "cancelled") stopped = true
+    }
+    // A running turn reports "stopped" from onChatResponse, which the
+    // sender ignores. Anything else must not report later.
+    if (stopped) return
+    if (this.ctx.storage.kv.get(doneKey) !== undefined) return
+    this.ctx.storage.kv.put(doneKey, Date.now())
+    const messages = this.messages
+    const index = messages.findIndex(
+      (m) => m.role === "user" && metaOf(m).task?.id === taskId
+    )
+    if (index === -1) return
+    await this.closeApprovalsAfter(
+      index,
+      "Stopped before anyone answered, so this was not done."
+    )
+    await this.cancelDelegations({ triggerId: messages[index].id })
+    if (this.state.status === "action_needed" && !this.needsUser()) {
+      await this.setStatus("idle")
+    }
+  }
+
+  /** Deny every card still waiting in the reply to the user message at `index`. */
+  private async closeApprovalsAfter(index: number, reason: string) {
+    const messages = this.messages
+    for (let i = index + 1; i < messages.length; i++) {
+      const message = messages[i]
+      if (message.role === "user") break
+      if (!message.parts.some((p) => pendingApprovalId(p))) continue
+      const updated: UIMessage = {
+        ...message,
+        parts: message.parts.map((part) =>
+          pendingApprovalId(part) ? expireApproval(part, reason) : part
+        ),
+      }
+      await this.updateMessageInHistory(updated)
+      this.broadcast(
+        JSON.stringify({
+          type: CHAT_MESSAGE_TYPES.MESSAGE_UPDATED,
+          message: updated,
+        })
+      )
+    }
+    this.syncDesk()
+  }
+
+  /**
+   * Task and routine turns that ended without reporting: the user moved
+   * past an approval card, nobody answered it in time, or the turn was cut
+   * off. Settle them, so whoever handed out the work hears back and the
+   * routine's history shows how it ended.
+   */
+  private async settleStranded(now: number) {
+    const messages = this.messages
+    const busy =
+      this.#turnActive ||
+      this.state.status === "thinking" ||
+      this.state.status === "working"
+    for (let i = 0; i < messages.length; i++) {
+      const trigger = messages[i]
+      if (trigger.role !== "user") continue
+      const meta = metaOf(trigger)
+      if (!meta.task && !meta.routine) continue
+      const reply: UIMessage[] = []
+      let j = i + 1
+      while (j < messages.length && messages[j].role !== "user") {
+        reply.push(messages[j++])
+      }
+      if (reply.some((m) => m.parts.some((p) => pendingApprovalId(p)))) {
+        continue
+      }
+      // Moved past: a later message started, so this turn is over for
+      // good. Otherwise only once it has clearly stopped.
+      const movedPast = j < messages.length
+      const age = now - (meta.at ?? now)
+      // Older work was settled by whoever handed it out long ago, or gave up.
+      if (age > 7 * DAY_MS) continue
+      const old = age > STRANDED_MS
+      if (!movedPast && (busy || !old || !reply.length)) continue
+      const expired = reply.some((m) =>
+        m.parts.some((p) =>
+          /Nobody answered/.test(
+            String((p as { approval?: { reason?: string } }).approval?.reason)
+          )
+        )
+      )
+      const error = expired
+        ? "Nobody approved what it needed within 24 hours."
+        : "It stopped before finishing."
+      if (
+        meta.task &&
+        this.ctx.storage.kv.get(`task_done:${meta.task.id}`) === undefined
+      ) {
+        const last = reply.at(-1)
+        await this.reportTask(meta.task, {
+          status: "stopped",
+          text: last ? finalText(last) || textOf(last) : "",
+          error,
+        })
+      }
+      if (meta.routine) {
+        this.sql`UPDATE routine_runs SET status = 'stopped',
+          finished_at = ${now}, note = ${error}
+          WHERE id = ${meta.routine.runId}
+            AND status IN ('running', 'waiting')`
+      }
+    }
   }
 
   /** Tasks this bot handed out that have not come back yet. */
@@ -5072,6 +5589,25 @@ export class BotAgent extends Think<Env, BotState> {
 
   /** Send a finished task's final reply back to whoever handed it out. */
   private async finishTask(task: BotTask, result: ChatResponseResult) {
+    await this.reportTask(task, {
+      status:
+        result.status === "completed"
+          ? "done"
+          : result.status === "aborted"
+            ? "stopped"
+            : "failed",
+      text: finalText(result.message) || textOf(result.message),
+      ...(result.status === "error"
+        ? { error: clip(result.error?.trim() || "The model call failed.", 300) }
+        : {}),
+    })
+  }
+
+  /** Report a task's outcome to whoever handed it out, once. */
+  private async reportTask(
+    task: BotTask,
+    ended: { status: TaskOutcome["status"]; text: string; error?: string }
+  ) {
     const doneKey = `task_done:${task.id}`
     // Recovery can deliver the hook twice; only the first one reports.
     if (this.ctx.storage.kv.get(doneKey) !== undefined) return
@@ -5083,17 +5619,10 @@ export class BotAgent extends Think<Env, BotState> {
       ? await this.readAttachments(paths)
       : { files: [] }
     const outcome: TaskOutcome = {
-      status:
-        result.status === "completed"
-          ? "done"
-          : result.status === "aborted"
-            ? "stopped"
-            : "failed",
-      result: isNoUpdate(finalText(result.message))
-        ? ""
-        : finalText(result.message) || textOf(result.message),
-      ...(result.status === "error"
-        ? { error: clip(result.error?.trim() || "The model call failed.", 300) }
+      status: ended.status,
+      result: isNoUpdate(ended.text) ? "" : ended.text,
+      ...(ended.error
+        ? { error: ended.error }
         : "error" in attachments
           ? { error: `Files were not sent: ${attachments.error}` }
           : {}),
@@ -5417,8 +5946,9 @@ export class BotAgent extends Think<Env, BotState> {
   ) {
     const row = this.sql<{ name: string; status: string }>`SELECT name, status
       FROM routine_runs WHERE id = ${run.runId}`[0]
-    // Recovery can deliver the hook twice; only the first one counts.
-    if (!row || row.status !== "running") return
+    // Recovery can deliver the hook twice; only the first one counts. A run
+    // that waited on an approval ends when its continuation does.
+    if (!row || (row.status !== "running" && row.status !== "waiting")) return
     const now = Date.now()
     if (result.status !== "error") {
       const status = outcome.waiting
@@ -5898,8 +6428,61 @@ export class BotAgent extends Think<Env, BotState> {
   }
 
   /** Durable Object RPC: state and history for the first server render. */
+  /** For opening the bot: its state and newest messages. */
   async snapshot(): Promise<{ state: BotState; messages: UIMessage[] }> {
-    return { state: this.state, messages: this.messages }
+    return {
+      state: this.state,
+      messages: this.messages.slice(-CLIENT_MESSAGES),
+    }
+  }
+
+  /** "Show earlier": the messages just before the oldest one shown. */
+  @callable()
+  olderMessages(beforeId: string): UIMessage[] {
+    return olderThan(this.messages, beforeId)
+  }
+
+  /**
+   * Think sends the browser the whole transcript: on connect, after every
+   * change, and when it rolls back a dropped send. For a long chat that is
+   * megabytes each time, read and drawn in full. Send the newest
+   * CLIENT_MESSAGES instead; older ones load on request (olderMessages).
+   *
+   * Safe because Think only upserts what a browser posts back: it never
+   * deletes a message the browser left out. These are Think internals
+   * (0.21); if they move, the bot warns and sends everything, as before.
+   */
+  private windowClientTranscript() {
+    const think = this as unknown as {
+      _broadcast?: (message: unknown, exclude?: string[]) => void
+      _buildIdleConnectMessages?: () => Promise<unknown[]>
+      _rollbackDroppedSubmit?: (connection: {
+        send(data: string): void
+      }) => void
+    }
+    const broadcast = think._broadcast
+    const idle = think._buildIdleConnectMessages
+    if (
+      typeof broadcast !== "function" ||
+      typeof idle !== "function" ||
+      typeof think._rollbackDroppedSubmit !== "function"
+    ) {
+      console.warn("Think internals moved: sending the whole transcript")
+      return
+    }
+    think._broadcast = (message, exclude) =>
+      broadcast.call(this, windowFrame(message), exclude)
+    think._buildIdleConnectMessages = async () =>
+      (await idle.call(this)).map(windowFrame)
+    think._rollbackDroppedSubmit = (connection) =>
+      connection.send(
+        JSON.stringify(
+          windowFrame({
+            type: CHAT_MESSAGE_TYPES.CHAT_MESSAGES,
+            messages: this.messages,
+          })
+        )
+      )
   }
 
   // ── Browser-facing (settings and the Computer panel) ────────────────

@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useMemo } from "react"
+import type { Surface } from "@/lib/surface/types"
 import { useAgent } from "agents/react"
-import { syncBotSummaries } from "@/lib/bot-cache"
+import { setBotFetcher, syncBotSummaries } from "@/lib/bot-cache"
 import type { ReactNode } from "react"
 import type { UIMessage } from "ai"
 import type {
@@ -108,6 +109,16 @@ export interface DeskApi {
   dismiss: (cardIds: string[]) => Promise<void>
   restore: (cardIds: string[]) => Promise<void>
   markSeen: () => void
+  /** The surfaces bots pinned to these cards, by card id. */
+  surfaces: (cardIds: string[]) => Promise<Record<string, Surface>>
+  /** A button on a pinned surface; `say` buttons send their text. */
+  surfaceAction: (
+    cardId: string,
+    version: number,
+    target: string,
+    values: Record<string, unknown>,
+    say?: boolean
+  ) => Promise<void>
 }
 
 export interface PipelinesApi {
@@ -118,6 +129,8 @@ export interface PipelinesApi {
   stop: (runId: string) => Promise<void>
   /** A step's full result; state only carries the start of it. */
   output: (runId: string, step: number) => Promise<string | null>
+  /** Every recent run of one pipeline; state only carries the latest. */
+  history: (pipelineId: string) => Promise<PipelineRun[]>
 }
 
 export interface ModelsApi {
@@ -224,6 +237,18 @@ export function LiveHubProvider({ viewer, initial, children }: ProviderProps) {
   }, [state.bots])
 
   const live = agent.state !== undefined
+  useEffect(() => {
+    if (!live) return
+    setBotFetcher(async (botId) => {
+      const snapshot = await agent.stub.botSnapshot(botId)
+      if (!snapshot) return null
+      return {
+        state: snapshot.state,
+        messages: JSON.parse(snapshot.messagesJson) as UIMessage[],
+      }
+    })
+    return () => setBotFetcher(null)
+  }, [live, agent])
   const shop = useMemo<ShopApi | null>(
     () =>
       live
@@ -306,6 +331,8 @@ export function LiveHubProvider({ viewer, initial, children }: ProviderProps) {
                 agent.stub.answerPipelineStep(runId, approved),
               stop: (runId) => agent.stub.stopPipelineRun(runId),
               output: (runId, step) => agent.stub.pipelineOutput(runId, step),
+              history: (pipelineId) =>
+                agent.stub.pipelineRunHistory(pipelineId),
             }
           : null,
       refreshSpend:
@@ -317,6 +344,15 @@ export function LiveHubProvider({ viewer, initial, children }: ProviderProps) {
               dismiss: (ids) => agent.stub.dismissCards(ids),
               restore: (ids) => agent.stub.restoreCards(ids),
               markSeen: () => void agent.stub.markDeskSeen(),
+              surfaces: (ids) => agent.stub.getDeskSurfaces(ids),
+              surfaceAction: (cardId, version, target, values, say) =>
+                agent.stub.deskSurfaceAction(
+                  cardId,
+                  version,
+                  target,
+                  values,
+                  say
+                ),
             }
           : null,
       shop,

@@ -35,7 +35,8 @@ import { SkillInstall } from "@/components/skill-install"
 import { ComputerCard } from "@/components/computer-card"
 import { ShimmerText } from "@/components/shimmer-text"
 import { SignInButton } from "@/components/sign-in-button"
-import { ShowActions, ShowBlocks } from "@/components/show-blocks"
+import { SurfaceView } from "@/components/surface/surface"
+import type { OnSurfaceEvent } from "@/components/surface/surface"
 import { ShopCheckoutCard } from "@/components/shop-checkout"
 import { ShopResults } from "@/components/shop-results"
 import { WorkGroup } from "@/components/work-group"
@@ -56,6 +57,9 @@ import { botIdFromLink, splitMentions } from "@/lib/bot-links"
 import { choiceKey, choiceOptions, sameEndpoint } from "@/lib/choices"
 import { connectionStatus } from "@/lib/connection-status"
 import { BotContext } from "@/lib/bot-context"
+import { draftSurface, latestSurfaces } from "@/lib/surface/thread"
+import type { ThreadSurface } from "@/lib/surface/thread"
+import type { SurfaceToolOutput } from "@/lib/surface/types"
 import { useHub } from "@/lib/hub-context"
 import { NO_UPDATE } from "@/lib/types"
 import type { UIMessage } from "ai"
@@ -106,6 +110,11 @@ interface ThreadProps {
   onScriptApproval?: OnScriptApproval
   /** Id of the first message that was unread when the thread opened. */
   unreadFrom?: string
+  /**
+   * Loads the messages before the oldest one shown, resolving to how many
+   * came back. Absent when there are none.
+   */
+  onLoadEarlier?: () => Promise<number>
 }
 
 export type OnScriptApproval = (
@@ -737,6 +746,90 @@ function SecretCard({
   )
 }
 
+/** Scroll a surface into view and make it glow once, so the eye finds it. */
+function revealSurface(id: string) {
+  const el = document.querySelector<HTMLElement>(
+    `[data-surface="${CSS.escape(id)}"]`
+  )
+  if (!el) return
+  el.scrollIntoView({ block: "center", behavior: "smooth" })
+  el.dataset.flash = ""
+  setTimeout(() => delete el.dataset.flash, 1600)
+}
+
+/**
+ * A surface where the bot showed it, or a line where it changed it. Every
+ * copy of a surface draws its newest version in one place: earlier
+ * placements become a line that points to it.
+ */
+function SurfaceBlock({
+  call,
+  update,
+  surfaces,
+  onEvent,
+  onSay,
+  busy,
+  readFile,
+}: {
+  call: ToolCall
+  update: boolean
+  surfaces: Map<string, ThreadSurface>
+  onEvent?: OnSurfaceEvent
+  onSay?: (text: string) => void
+  busy: boolean
+  readFile?: ReadFileData
+}) {
+  const output = call.output as SurfaceToolOutput | undefined
+  if (call.state === "running") {
+    return (
+      <SurfaceView
+        surface={draftSurface(call.input)}
+        placement="thread"
+        interactive={false}
+        readFile={readFile}
+      />
+    )
+  }
+  if (!output?.ok) return null
+  const id = output.surface.id
+  const latest = surfaces.get(id)
+  if (latest && latest.anchor === call.id) {
+    return (
+      <SurfaceView
+        // Remount when a later show replaces it, so field edits reset.
+        key={latest.surface.id}
+        surface={latest.surface}
+        placement="thread"
+        onEvent={onEvent}
+        onSay={onSay ? (text) => onSay(text) : undefined}
+        busy={busy}
+        readFile={readFile}
+      />
+    )
+  }
+  const title = output.surface.title ?? "the results"
+  const label = update
+    ? output.surface.status === "closed"
+      ? `Finished ${title}`
+      : `Updated ${title}`
+    : `${title} moved below`
+  return (
+    <SystemEvent>
+      {latest ? (
+        <button
+          type="button"
+          onClick={() => revealSurface(id)}
+          className="rounded-full px-2 underline-offset-4 hover:text-kumo-default hover:underline"
+        >
+          {label}
+        </button>
+      ) : (
+        label
+      )}
+    </SystemEvent>
+  )
+}
+
 function AssistantMessage({
   blocks,
   live,
@@ -752,12 +845,20 @@ function AssistantMessage({
   onProvideSecret,
   onAnswerChoice,
   onPick,
+  surfaces,
+  onSurfaceEvent,
+  busy,
 }: {
   blocks: Block[]
   /** This reply is still being written. */
   live: boolean
-  /** Sends a shown action as the user's next message. Newest reply only. */
+  /** Sends a surface's say button as the user's next message. */
   onPick?: (text: string) => void
+  /** The newest copy of every surface in the thread. */
+  surfaces: Map<string, ThreadSurface>
+  onSurfaceEvent?: OnSurfaceEvent
+  /** The bot is working. */
+  busy: boolean
   startedAt?: number
   durationMs?: number
   botId?: string
@@ -796,10 +897,6 @@ function AssistantMessage({
         </Fragment>
       ))}
       {groupAt >= shown.length ? group : null}
-      <ShowActions
-        calls={shown.flatMap((b) => (b.kind === "show" ? [b.call] : []))}
-        onPick={live ? undefined : onPick}
-      />
     </>
   )
 
@@ -880,8 +977,20 @@ function AssistantMessage({
         return <ShopCheckoutCard key={block.key} call={block.call} />
       case "connect":
         return <ConnectCard call={block.call} onApproval={onApproval} />
-      case "show":
-        return <ShowBlocks call={block.call} />
+      case "surface":
+      case "surface-update":
+        return (
+          <SurfaceBlock
+            key={block.key}
+            call={block.call}
+            update={block.kind === "surface-update"}
+            surfaces={surfaces}
+            onEvent={onSurfaceEvent}
+            onSay={onPick}
+            busy={busy}
+            readFile={readFile}
+          />
+        )
       case "skill":
         return (
           <SkillCard
@@ -898,6 +1007,25 @@ function AssistantMessage({
 function UserMessage({ message }: { message: UIMessage }) {
   const origin = originOf(message)
   const text = messageText(message)
+  const pressed = (message.metadata as MessageMeta | undefined)?.surfaceAction
+  if (pressed) {
+    return (
+      <div className="ml-auto flex max-w-[75%] flex-col items-end gap-1">
+        <div className="w-fit rounded-[22px] bg-kumo-contrast px-[18px] py-3 text-[15px] leading-[1.65] text-pretty text-kumo-inverse">
+          {pressed.label}
+        </div>
+        {pressed.title ? (
+          <button
+            type="button"
+            onClick={() => revealSurface(pressed.surfaceId)}
+            className="px-2 text-[13px] text-kumo-subtle hover:text-kumo-default"
+          >
+            On {pressed.title}
+          </button>
+        ) : null}
+      </div>
+    )
+  }
 
   if (origin?.kind === "bot") {
     const meta = message.metadata as MessageMeta | undefined
@@ -1066,6 +1194,7 @@ export function Thread({
   scriptApprovals,
   onScriptApproval,
   unreadFrom,
+  onLoadEarlier,
 }: ThreadProps) {
   // A link to one task's message (from a pipeline run) opens the thread there.
   const hash = useLocation({ select: (l) => l.hash })
@@ -1076,11 +1205,27 @@ export function Thread({
   // that arrive afterwards get the entrance animation.
   const history = useRef<Set<string> | null>(null)
   history.current ??= new Set(messages.map((m) => m.id))
+  // Older messages loaded above the first one are history too.
+  const firstKnown = messages.findIndex((m) => history.current?.has(m.id))
+  for (const m of messages.slice(0, Math.max(firstKnown, 0))) {
+    history.current.add(m.id)
+  }
   const isNew = (id: string) => !history.current?.has(id)
 
   const hydrated = useHydrated()
   // Absent on the server render and until the chat is live.
-  const pick = useContext(BotContext)?.send
+  const botContext = useContext(BotContext)
+  const pick = botContext?.send
+  const agent = botContext?.agent
+  const surfaces = useMemo(() => latestSurfaces(messages), [messages])
+  const onSurfaceEvent = useMemo<OnSurfaceEvent | undefined>(
+    () =>
+      agent
+        ? (id, version, target, values) =>
+            agent.stub.surfaceAction(id, version, target, values)
+        : undefined,
+    [agent]
+  )
   const rendered = useMemo(() => {
     const rows: Row[] = []
     let background = false
@@ -1161,8 +1306,36 @@ export function Thread({
     ((lastPart?.type === "text" && lastPart.state === "streaming") ||
       (lastTurn.work.length > 0 && lastTurn.replyKey === undefined) ||
       lastBlocks.at(-1)?.kind === "computer" ||
-      lastBlocks.at(-1)?.kind === "show")
+      lastBlocks.at(-1)?.kind === "surface")
   const waitingOnUser = bot.status === "action_needed"
+
+  // "Show earlier" adds messages above: keep what was on screen in place.
+  const [loadingEarlier, setLoadingEarlier] = useState(false)
+  const fromBottom = useRef<number | null>(null)
+  const firstId = messages[0]?.id
+  useLayoutEffect(() => {
+    const el = scroller.current
+    if (el && fromBottom.current !== null) {
+      el.scrollTop = el.scrollHeight - fromBottom.current
+      fromBottom.current = null
+    }
+  }, [firstId, scroller])
+  const showEarlier = async () => {
+    const el = scroller.current
+    if (!onLoadEarlier || loadingEarlier) return
+    release()
+    setLoadingEarlier(true)
+    try {
+      if (el) fromBottom.current = el.scrollHeight - el.scrollTop
+      // Nothing came back: do not carry the position over to a later change.
+      if ((await onLoadEarlier()) === 0) fromBottom.current = null
+    } catch (err) {
+      fromBottom.current = null
+      throw err
+    } finally {
+      setLoadingEarlier(false)
+    }
+  }
 
   return (
     <div
@@ -1174,6 +1347,19 @@ export function Thread({
         ref={content}
         className="mx-auto flex max-w-[820px] flex-col gap-5 px-4 pt-2 pb-8 md:px-6"
       >
+        {onLoadEarlier ? (
+          <div className="flex justify-center pt-2">
+            <Button
+              size="sm"
+              variant="ghost"
+              className="rounded-full text-kumo-subtle"
+              loading={loadingEarlier}
+              onClick={() => void showEarlier()}
+            >
+              Show earlier
+            </Button>
+          </div>
+        ) : null}
         {rendered.map(({ message, blocks, at, durationMs }, index) => (
           <Fragment key={message.id}>
             {message.id === unreadFrom ? (
@@ -1205,9 +1391,10 @@ export function Thread({
                 <AssistantMessage
                   blocks={blocks}
                   live={replying && index === rendered.length - 1}
-                  onPick={
-                    !busy && index === rendered.length - 1 ? pick : undefined
-                  }
+                  onPick={busy ? undefined : pick}
+                  surfaces={surfaces}
+                  onSurfaceEvent={onSurfaceEvent}
+                  busy={busy}
                   startedAt={at}
                   durationMs={durationMs}
                   botId={botId}
